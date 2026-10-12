@@ -1,0 +1,366 @@
+import os
+import json
+import time
+import requests
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+import gradio as gr
+from google import genai
+from google.genai.errors import ServerError
+
+# --- 1. Setup Device & Load CLIP Model (Mixed Precision) ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+model_id = "openai/clip-vit-base-patch32"
+model = CLIPModel.from_pretrained(model_id, torch_dtype=dtype).to(device)
+model.eval()
+processor = CLIPProcessor.from_pretrained(model_id)
+
+print(f"CLIP Model loaded successfully on {device} using {dtype}")
+
+# --- 2. Setup Gemini & Wikimedia Commons Integration ---
+api_key = os.environ.get("GEMINI_API_KEY")
+try:
+    from google.colab import userdata
+    api_key = api_key or userdata.get("GEMINI_API_KEY")
+except Exception:
+    pass
+
+client = genai.Client(api_key=api_key) if api_key else None
+MODEL_NAME = "gemini-3.8-flash"
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+
+commons_session = requests.Session()
+commons_session.headers.update({
+    "User-Agent": "MemoryTagAI/0.1 (educational image categorization prototype)"
+})
+
+# --- 3. Massive Scale Multi-Domain Taxonomy ---
+taxonomy = {
+    "Animals_and_Wildlife": [
+        "cat", "dog", "lion", "tiger", "cheetah", "elephant", "giraffe", "zebra", "kangaroo", 
+        "koala", "panda", "bear", "wolf", "fox", "deer", "moose", "monkey", "gorilla", "chimpanzee", 
+        "squirrel", "rabbit", "hedgehog", "bat", "whale", "dolphin", "shark", "octopus", "jellyfish", 
+        "seal", "penguin", "eagle", "hawk", "owl", "parrot", "flamingo", "peacock", "swan", "duck", 
+        "snake", "lizard", "turtle", "frog", "crocodile", "alligator", "butterfly", "bee", "spider", "ant"
+    ],
+    "Plants_and_Botanical": [
+        "rose", "tulip", "sunflower", "orchid", "daisy", "lily", "cactus", "succulent", "fern", 
+        "moss", "palm-tree", "pine-tree", "oak-tree", "bamboo", "bonsai", "ivy", "lavender", 
+        "lotus", "cherry-blossom", "maple-leaf", "mushroom", "vine", "seaweed", "wheat", "rice-plant"
+    ],
+    "Objects_and_Household": [
+        "table", "chair", "laptop", "smartphone", "books", "backpack", "clock", "guitar", "shoes", 
+        "television", "camera", "lamp", "glasses", "headset", "wallet", "keys", "umbrella",
+        "bottle", "desk", "sofa", "bed", "painting", "vase", "mirror", "pillow", "keyboard",
+        "mouse", "printer", "refrigerator", "microwave", "oven", "toaster", "blender", "wardrobe",
+        "bookshelf", "curtain", "rug", "candle", "trophy", "calculator", "scissors", "notebook"
+    ],
+    "Locations_and_Landscapes": [
+        "beach", "hill-station", "city", "village", "jungle", "mountains", "desert", 
+        "forest", "office", "indoor-room", "historical-site", "airport", "highway", 
+        "subway", "park", "museum", "library", "hospital", "stadium", "restaurant", 
+        "cafe", "supermarket", "factory", "harbor", "canyon", "valley", "island", "cave",
+        "volcano", "waterfall", "river", "glacier", "savanna", "tundra", "meadow", "skyscraper"
+    ],
+    "Events_and_Activities": [
+        "war", "party", "hackathons", "sports", "road-rage", "concert", "wedding", 
+        "conference", "festival", "protest", "parade", "graduation", "marathon", 
+        "exhibition", "carnival", "fireworks", "competition", "ceremony", "summit",
+        "camping", "hiking", "swimming", "surfing", "skiing", "cycling", "running", "yoga", "dancing"
+    ],
+    "Emotions_and_Abstract": [
+        "love", "sadness", "peace", "excitement", "melancholy", "awe", "tension", 
+        "joy", "mystery", "anxiety", "serenity", "nostalgia", "hope", "despair", 
+        "curiosity", "frustration", "enthusiasm", "tranquility", "solitude", "chaos", "harmony"
+    ],
+    "Technology_and_Science": [
+        "robotics", "circuit-board", "server-rack", "drone", "virtual-reality", 
+        "quantum-computer", "satellite", "solar-panel", "wind-turbine", "electric-car", 
+        "microchip", "fiber-optics", "telescope", "particle-collider", "biometric-scanner",
+        "dna-strand", "microscope", "laboratory", "stethoscope", "syringe", "atom-model"
+    ],
+    "Food_and_Drink": [
+        "pizza", "burger", "sushi", "pasta", "salad", "soup", "steak", "pancakes", 
+        "ice-cream", "chocolate", "wine", "cocktail", "espresso", "smoothie", "bacon", 
+        "cheese", "fruits", "vegetables", "bakery-bread", "curry", "sandwich", "tacos",
+        "ramen", "dumplings", "pudding", "donut", "croissant", "pomegranate", "avocado"
+    ],
+    "Art_and_Culture": [
+        "oil-painting", "sculpture", "graffiti", "pottery", "calligraphy", "ballet", 
+        "theater", "traditional-dance", "origami", "mosaic", "stained-glass", 
+        "street-performance", "fashion-runway", "tapestry", "woodwork", "violin",
+        "piano", "drum-kit", "saxophone", "flute", "trumpet", "dj-turntable"
+    ],
+    "Transport_and_Vehicles": [
+        "airplane", "helicopter", "train", "subway-train", "cruise-ship", "sailboat", 
+        "motorcycle", "scooter", "ambulance", "fire-engine", "police-car", "tractor", 
+        "bulldozer", "hot-air-balloon", "cable-car", "sports-car", "delivery-truck",
+        "yacht", "fighter-jet", "rocket-ship", "skateboard", "roller-skates"
+    ]
+}
+
+templates = [
+    "a photo of a {}.",
+    "a clear picture of a {}.",
+    "an image showing a {}.",
+    "a close-up photo of a {}."
+]
+
+flat_labels = []
+clean_mapping = {}
+curr_idx = 0
+for category, subcategories in taxonomy.items():
+    clean_mapping[curr_idx] = (category, None)
+    curr_idx += 1
+    for sub in subcategories:
+        clean_mapping[curr_idx] = (category, sub)
+        curr_idx += 1
+
+for category, subcategories in taxonomy.items():
+    for template in templates:
+        flat_labels.append(template.format(category.lower()))
+    for sub in subcategories:
+        sub_phrase = f"{sub.lower()}, a type of {category.lower()}"
+        for template in templates:
+            flat_labels.append(template.format(sub_phrase))
+
+label_mapping = clean_mapping
+
+# --- Fast Caching for Text Embeddings (Generates thousands of prompt variations instantly after 1st run) ---
+TEXT_CACHE_FILE = "text_embeddings_cache_massive.pt"
+
+if os.path.exists(TEXT_CACHE_FILE):
+    print("⚡ Loading pre-computed massive text embeddings from cache (Instant Startup!)...")
+    text_features = torch.load(TEXT_CACHE_FILE).to(device)
+else:
+    print(f"Computing ensembled text embeddings for {len(flat_labels)} massive prompt variations (Runs only once)...")
+    with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+        chunk_size = 128
+        all_text_features = []
+        for i in range(0, len(flat_labels), chunk_size):
+            chunk = flat_labels[i:i + chunk_size]
+            text_inputs = processor(text=chunk, return_tensors="pt", padding=True).to(device)
+            text_outputs = model.get_text_features(
+                input_ids=text_inputs["input_ids"], attention_mask=text_inputs["attention_mask"]
+            )
+            feat = text_outputs.text_embeds if hasattr(text_outputs, "text_embeds") else text_outputs.pooler_output
+            all_text_features.append(F.normalize(feat, p=2, dim=-1))
+        
+        text_features = torch.cat(all_text_features, dim=0)
+        num_templates = len(templates)
+        num_concepts = len(text_features) // num_templates
+        grouped_features = text_features.view(num_concepts, num_templates, -1).mean(dim=1)
+        text_features = F.normalize(grouped_features, p=2, dim=-1)
+        
+        torch.save(text_features.cpu(), TEXT_CACHE_FILE)
+        print("💾 Massive text embeddings cached successfully to disk!")
+
+# --- 4. Persistent Edge-Case Memory Bank ---
+MEMORY_FILE = "edge_case_memory.pt"
+if os.path.exists(MEMORY_FILE):
+    saved_data = torch.load(MEMORY_FILE)
+    memory_bank_embeddings = saved_data["embeddings"]
+    memory_bank_labels = saved_data["labels"]
+    print(f"📦 Loaded {len(memory_bank_embeddings)} persistent edge cases from disk[cite: 1]!")
+else:
+    memory_bank_embeddings = []
+    memory_bank_labels = []
+    print("📦 No saved memory bank found[cite: 1].")
+
+# --- 5. Discovery Helpers ---
+def discover_commons_categories(labels, per_label=2):
+    found = {}
+    for label in labels[:3]:
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": label,
+            "srnamespace": 14,
+            "srlimit": per_label,
+            "format": "json",
+        }
+        try:
+            response = commons_session.get(COMMONS_API, params=params, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            for item in data.get("query", {}).get("search", []):
+                found[item["title"]] = item["title"]
+        except requests.RequestException:
+            break
+    return list(found.values())
+
+def generate_with_retry(**kwargs):
+    for attempt in range(2):
+        try:
+            return client.models.generate_content(**kwargs)
+        except ServerError:
+            if attempt == 1:
+                raise
+            time.sleep(1)
+
+# --- 6. Adaptive Dominance Classification Engine ---
+def comprehensive_classify(input_image):
+    if input_image is None:
+        return "Please upload an image first.", "⚡ System standing by."
+
+    if isinstance(input_image, str):
+        image = Image.open(input_image).convert("RGB")
+    else:
+        image = Image.fromarray(input_image).convert("RGB")
+
+    inputs = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+        image_outputs = model.get_image_features(pixel_values=inputs["pixel_values"])
+        image_features = image_outputs.image_embeds if hasattr(image_outputs, "image_embeds") else image_outputs.pooler_output
+
+    if not isinstance(image_features, torch.Tensor):
+        image_features = image_features[0]
+    image_features = F.normalize(image_features, p=2, dim=-1)
+
+    # 1. Check Permanent Memory Bank Override
+    if len(memory_bank_embeddings) > 0:
+        mem_tensor = torch.stack(memory_bank_embeddings).to(device)
+        mem_sims = (image_features @ mem_tensor.T).squeeze(0)
+        if mem_sims.dim() == 0:
+            mem_sims = mem_sims.unsqueeze(0)
+        best_mem_idx = torch.argmax(mem_sims).item()
+        best_mem_score = mem_sims[best_mem_idx].item()
+        
+        if best_mem_score > 0.80:
+            cat, sub = memory_bank_labels[best_mem_idx]
+            sub_str = f"➡️ **Subcategory:** `{sub}`" if sub else "*(Parent Category)*"
+            result_md = f"### ⚡ Direct Edge Case Override Match\n\n- **Category:** `{cat}` {sub_str}\n- **Confidence:** **{round(best_mem_score * 100, 2)}%** *(Matched from permanent memory)*"
+            return result_md, "✅ Loaded from persistent edge-case memory[cite: 1]."
+
+    # 2. Adaptive Dominance Selection (Top 1-2 if dominant, else Top 5)
+    similarities = (image_features @ text_features.T).squeeze(0)
+    probabilities = (similarities * 100).softmax(dim=-1)
+
+    top_probs, top_indices = torch.topk(probabilities, k=5)
+    
+    top_score = top_probs[0].item()
+    second_score = top_probs[1].item()
+    confidence_gap = top_score - second_score
+
+    output_markdown = ""
+
+    if top_score >= 50.0 or confidence_gap >= 20.0:
+        k_to_show = 2 if (second_score >= top_score * 0.75 or confidence_gap < 12.0) else 1
+        output_markdown += f"### ✨ Clear Dominant Match Found (Top {k_to_show})\n\n"
+        
+        for i in range(k_to_show):
+            score = top_probs[i].item()
+            idx = top_indices[i].item()
+            category, subcategory = label_mapping[idx]
+            sub_str = f"➡️ **Subcategory:** `{subcategory}`" if subcategory else "*(Parent Category)*"
+            output_markdown += f"- **Category:** `{category}` {sub_str} — **{round(score, 2)}%**\n"
+    else:
+        output_markdown += "### 🔍 No clear dominant match; showing top 5 possibilities:\n\n"
+        for score, idx in zip(top_probs, top_indices):
+            category, subcategory = label_mapping[idx.item()]
+            sub_str = f"➡️ `{subcategory}`" if subcategory else "*(Parent Category)*"
+            output_markdown += f"- **{category}** {sub_str} — **{round(score.item(), 2)}%**\n"
+
+    # 3. Gemini & Wikimedia Commons Deep Enrichment
+    if client:
+        try:
+            label_prompt = "Return 3 short category keywords for this image as a JSON array of strings."
+            label_resp = generate_with_retry(model=MODEL_NAME, contents=[label_prompt, image], config={"response_mime_type": "application/json", "response_schema": list[str]})
+            labels = json.loads(label_resp.text)[:3]
+            candidates = discover_commons_categories(labels, per_label=2)
+            if candidates:
+                output_markdown += f"\n\n### 🌐 Wikimedia Commons Discoveries:\n" + "".join(f"\n- `{c}`" for c in candidates[:4])
+        except Exception:
+            pass
+
+    return output_markdown, "✅ Analysis complete[cite: 1, 2, 6]."
+
+# --- 7. Automated Edge Case Learning Function ---
+def submit_correction(current_image, correct_category, correct_subcategory):
+    if current_image is None or not correct_category:
+        return "⚠️ Please provide an image and a category name to save."
+
+    if isinstance(current_image, str):
+        image = Image.open(current_image).convert("RGB")
+    else:
+        image = Image.fromarray(current_image).convert("RGB")
+
+    inputs = processor(images=image, return_tensors="pt").to(device)
+    with torch.no_grad(), torch.autocast(device_type="cuda" if torch.cuda.is_available() else "cpu", enabled=torch.cuda.is_available()):
+        image_outputs = model.get_image_features(pixel_values=inputs["pixel_values"])
+        image_features = image_outputs.image_embeds if hasattr(image_outputs, "image_embeds") else image_outputs.pooler_output
+
+    if not isinstance(image_features, torch.Tensor):
+        image_features = image_features[0]
+    image_features = F.normalize(image_features, p=2, dim=-1).squeeze(0)
+
+    memory_bank_embeddings.append(image_features.cpu())
+    memory_bank_labels.append((correct_category.strip(), correct_subcategory.strip() if correct_subcategory else None))
+
+    torch.save({
+        "embeddings": memory_bank_embeddings,
+        "labels": memory_bank_labels
+    }, MEMORY_FILE)
+
+    return f"✅ Saved permanently to disk! Total saved edge cases: {len(memory_bank_embeddings)}[cite: 1]"
+
+# --- 8. UI ---
+ultra_premium_theme = """
+body, .gradio-container {
+    background: linear-gradient(135deg, #090d16 0%, #110722 45%, #05161c 100%) !important;
+    background-attachment: fixed !important;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif !important;
+}
+.gradio-container { max-width: 1200px !important; }
+.md-text h1 {
+    font-size: 2.5rem !important;
+    background: linear-gradient(90deg, #00ffaa 0%, #00bcff 50%, #bd00ff 100%) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    font-weight: 900 !important; text-align: center !important;
+}
+.custom-box {
+    border: 1px solid rgba(255, 255, 255, 0.10) !important;
+    border-radius: 16px !important;
+    background: rgba(13, 17, 23, 0.55) !important;
+    backdrop-filter: blur(20px) !important;
+    padding: 20px !important;
+}
+.primary-btn {
+    background: linear-gradient(90deg, #00ffaa 0%, #00bcff 100%) !important;
+    color: #050811 !important; font-weight: 800 !important; border-radius: 8px !important;
+}
+"""
+
+with gr.Blocks(css=ultra_premium_theme, title="MemoryTag AI | Massive Scale Engine") as demo:
+    gr.Markdown("# 🤖 MEMORYTAG AI — MASSIVE SCALE ENGINE")
+    gr.Markdown("<center>Expanded Multi-Domain Taxonomy + Disk Caching + Smart Dominance Matching</center>")
+
+    with gr.Row(equal_height=False):
+        with gr.Column(elem_classes=["custom-box"], scale=1):
+            gr.Markdown("### 📥 IMAGE INGESTION")
+            image_input = gr.Image(label="Upload image asset", type="numpy", height=320)
+            analyze_button = gr.Button("🧠 RUN MASSIVE ANALYSIS", variant="primary", elem_classes=["primary-btn"])
+        
+        with gr.Column(elem_classes=["custom-box"], scale=1):
+            gr.Markdown("### 📊 RESULTS")
+            status_terminal = gr.Textbox(label="Engine status", value="⚡ System standing by.", interactive=False, lines=2)
+            category_output = gr.Markdown(label="Classification & Discoveries")
+            clear_button = gr.ClearButton([image_input, category_output, status_terminal], value="Clear")
+
+    analyze_button.click(fn=comprehensive_classify, inputs=image_input, outputs=[category_output, status_terminal])
+
+    gr.Markdown("### 🛠️ TEACH EDGE CASE")
+    with gr.Row(elem_classes=["custom-box"]):
+        corr_cat = gr.Textbox(label="Correct Category")
+        corr_sub = gr.Textbox(label="Correct Subcategory (optional)")
+    corr_btn = gr.Button("💾 Save Correction", elem_classes=["primary-btn"])
+    corr_output = gr.Markdown()
+
+    corr_btn.click(fn=submit_correction, inputs=[image_input, corr_cat, corr_sub], outputs=corr_output)
+
+demo.launch(share=False, debug=True)

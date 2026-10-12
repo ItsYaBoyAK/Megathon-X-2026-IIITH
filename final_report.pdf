@@ -1,0 +1,51 @@
+PROJECT REPORT: MEMORYTAG AI — MASSIVE SCALE MULTI-DOMAIN IMAGE CLASSIFICATION & DISCOVERY ENGINE
+1. Project Overview & Motivation
+MemoryTag AI is an advanced, hybrid image categorization and contextual discovery prototype designed to bridge the gap between traditional zero-shot vision models (CLIP) and generative AI (Google Gemini / Wikimedia Commons). Standard computer vision models often struggle with fine-grained multi-domain taxonomies or domain-specific edge cases. MemoryTag AI solves this by combining rapid zero-shot embedding similarity, disk-cached text prompt ensembling, an adaptive confidence-gap routing mechanism, and a persistent edge-case correction memory bank.
+
+2. Core Architecture & Tech Stack
+Deep Learning Framework: PyTorch with mixed-precision (torch.float16) support for hardware acceleration on CUDA devices.
+
+Vision-Language Backbone: OpenAI's clip-vit-base-patch32 via Hugging Face Transformers (CLIPModel and CLIPProcessor).
+
+Generative Intelligence & Enrichment: Google GenAI SDK (gemini-3.8-flash) combined with the Wikimedia Commons MediaWiki API for automated category harvesting.
+
+User Interface: Gradio (gr.Blocks) styled with custom CSS gradients and dark-mode glassmorphism aesthetics.
+
+Persistence Layer: Local PyTorch tensor serialization (.pt files) for lightning-fast text embedding cache loading and permanent edge-case memory overrides.
+
+3. Key Functional Modules
+A. Massive Multi-Domain Taxonomy & Text Caching
+The engine utilizes a hierarchical taxonomy spanning 10 distinct domains (Animals, Plants, Objects, Locations, Events, Emotions, Technology, Food, Art, and Transport) containing hundreds of fine-grained subcategories.
+
+To maximize robustness, each label is passed through multiple prompt engineering templates (e.g., "a photo of a {}", "a close-up photo of a {}").
+
+Optimization: Computing thousands of prompt combinations on startup would normally cause a heavy bottleneck. MemoryTag AI solves this by computing ensembled text embeddings once and serializing them into text_embeddings_cache_massive.pt. Subsequent startups load these embeddings instantly.
+
+B. Adaptive Dominance Classification Engine
+Instead of blindly returning a fixed number of predictions, the classifier analyzes the statistical confidence distribution of top matches:
+
+If a top match exceeds a 50% absolute probability or maintains a commanding gap over secondary candidates, it highlights a clean dominant result.
+
+If ambiguity is detected, it automatically expands the output view to the top 5 possibilities to ensure transparency.
+
+C. Persistent Edge-Case Memory Bank
+Real-world usage often exposes model blind spots. MemoryTag AI features a built-in correction loop (edge_case_memory.pt):
+
+Users can upload a misclassified image, input the correct category and subcategory, and save it.
+
+The system computes and stores the image feature embedding directly into a local memory bank.
+
+Future inferences check this memory bank first; if a cosine similarity threshold (>0.80) is met, the system triggers an instant override using the user-defined correction.
+
+D. External Enrichment via Gemini & Wikimedia Commons
+When an image is processed, Gemini analyzes visual context to suggest search tags, which are then queried against Wikimedia Commons to pull related community-curated categories and metadata, enriching the output beyond raw classification.
+
+4. Performance & Engineering Highlights
+Cold-Start Elimination: Disk-cached text embeddings reduce initialization time from minutes to milliseconds.
+
+Hardware Agnostic: Automatically detects CUDA availability, seamlessly falling back to CPU with appropriate floating-point precision adjustments.
+
+Fault Tolerant API Integration: Implements retry logic with exponential backoff for cloud-based GenAI calls to handle transient server errors smoothly.
+
+5. Conclusion
+MemoryTag AI successfully demonstrates how lightweight zero-shot models can be augmented with localized caching, adaptive thresholding, and continuous human-in-the-loop learning. By fusing local embedding math with generative retrieval, the system offers a scalable, responsive, and highly extensible framework for intelligent asset management and image tagging.
